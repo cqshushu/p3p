@@ -102,6 +102,7 @@
 
         <activity
             android:name=".ui.activity.P3PScannerActivity"
+            android:label="P3P Scanner"
             android:configChanges="screenSize|smallestScreenSize|screenLayout|uiMode"
             android:screenOrientation="fullUser"
             android:theme="@style/Theme.App"
