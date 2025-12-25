@@ -101,6 +101,18 @@
             android:supportsPictureInPicture="true" />
 
         <activity
+            android:name=".ui.activity.P3PScannerActivity"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|uiMode"
+            android:screenOrientation="fullUser"
+            android:theme="@style/Theme.App"
+            android:windowSoftInputMode="adjustPan">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
             android:name=".ui.activity.ScanActivity"
             android:configChanges="screenSize|smallestScreenSize|screenLayout|uiMode"
             android:screenOrientation="fullUser" />
