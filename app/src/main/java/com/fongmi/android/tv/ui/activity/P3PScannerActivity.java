@@ -1,6 +1,10 @@
 package com.fongmi.android.tv.ui.activity;
 
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.ServiceConnection;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.text.TextUtils;
 import android.view.View;
 import android.widget.Button;
@@ -9,27 +13,39 @@ import android.widget.TextView;
 
 import androidx.appcompat.app.AppCompatActivity;
 
+import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.R;
+import com.forcetech.Util;
+import com.github.catvod.net.OkHttp;
+import com.google.common.net.HttpHeaders;
 
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.Map;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class P3PScannerActivity extends AppCompatActivity {
+import okhttp3.Response;
+
+public class P3PScannerActivity extends AppCompatActivity implements ServiceConnection {
 
     private EditText etUrl;
     private Button btnScan;
     private TextView tvStatus;
     private TextView tvResult;
-    private ExecutorService executorService;
+    private ExecutorService scannerExecutor;
+    private Thread verifierThread;
     private boolean isScanning = false;
+    private BlockingQueue<Integer> candidatePorts;
+    private boolean isServiceConnected = false;
 
     // Pattern to match p3p://ip:(start-end)/id
-    // Example: p3p://192.168.1.1:(8080-8090)/mvc
     private static final Pattern PATTERN = Pattern.compile("p3p://([^:]+):\\((\\d+)-(\\d+)\\)/(.+)");
 
     @Override
@@ -42,16 +58,24 @@ public class P3PScannerActivity extends AppCompatActivity {
         tvStatus = findViewById(R.id.tv_status);
         tvResult = findViewById(R.id.tv_result);
 
-        btnScan.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                if (isScanning) {
-                    stopScan();
-                } else {
-                    startScan();
-                }
+        btnScan.setOnClickListener(v -> {
+            if (isScanning) {
+                stopScan();
+            } else {
+                startScan();
             }
         });
+
+        // Bind service on creation to be ready
+        initService();
+    }
+
+    private void initService() {
+        try {
+            App.get().bindService(Util.intent(App.get(), "p3p"), this, Context.BIND_AUTO_CREATE);
+        } catch (Exception e) {
+            tvStatus.setText("Error binding service: " + e.getMessage());
+        }
     }
 
     private void startScan() {
@@ -67,7 +91,7 @@ public class P3PScannerActivity extends AppCompatActivity {
             return;
         }
 
-        String ip = matcher.group(1);
+        String targetIp = matcher.group(1);
         int startPort = Integer.parseInt(matcher.group(2));
         int endPort = Integer.parseInt(matcher.group(3));
         String id = matcher.group(4);
@@ -79,78 +103,70 @@ public class P3PScannerActivity extends AppCompatActivity {
 
         isScanning = true;
         btnScan.setText("Stop Scan");
-        tvStatus.setText("Scanning " + ip + " [" + startPort + "-" + endPort + "]...");
-        tvResult.setText("");
-
-        int totalPorts = endPort - startPort + 1;
-        AtomicInteger scannedCount = new AtomicInteger(0);
-        executorService = Executors.newFixedThreadPool(200); // High concurrency
-
-        for (int port = startPort; port <= endPort; port++) {
-            final int p = port;
-            executorService.execute(new Runnable() {
-                @Override
-                public void run() {
-                    if (Thread.currentThread().isInterrupted() || !isScanning)
-                        return;
-
-                    boolean isOpen = checkPort(ip, p);
-
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (isOpen) {
-                                String validUrl = "p3p://" + ip + ":" + p + "/" + id;
-                                tvResult.append(validUrl + "\n");
-                            }
-                            int count = scannedCount.incrementAndGet();
-                            if (count % 50 == 0 || count == totalPorts) {
-                                tvStatus.setText("Scanning: " + count + "/" + totalPorts);
-                            }
-                            if (count == totalPorts) {
-                                finishScan();
-                            }
-                        }
-                    });
-                }
-            });
-        }
+        tvStatus.setText("Initializing scan for " + targetIp + "...");
+        verifierThread.start();
     }
 
-    private boolean checkPort(String ip, int port) {
+    private boolean verifyP3P(String ip, int port, String id) {
         try {
-            Socket socket = new Socket();
-            socket.connect(new InetSocketAddress(ip, port), 2000); // 2s timeout
-            socket.close();
-            return true;
+            int localPort = Util.P3P; // 9907
+            // 1. Switch Channel
+            // http://127.0.0.1:9907/cmd.xml?cmd=switch_chan&server=ip:port&id=id
+            String cmdUrl = "http://127.0.0.1:" + localPort + "/cmd.xml?cmd=switch_chan&server=" + ip + ":" + port
+                    + "&id=" + id;
+            OkHttp.string(cmdUrl, Map.of(HttpHeaders.USER_AGENT, "MTV")); // Send command, ignore result
+
+            // 2. Try to Read Stream
+            // http://127.0.0.1:9907/id
+            String streamUrl = "http://127.0.0.1:" + localPort + "/" + id;
+
+            // Allow some time for buffering
+            Thread.sleep(500);
+
+            try (Response response = OkHttp.newCall(streamUrl, Map.of(HttpHeaders.USER_AGENT, "MTV")).execute()) {
+                if (response.isSuccessful() && response.body() != null) {
+                    // Try to read a small chunk to ensure it's a real stream
+                    byte[] buffer = new byte[1024];
+                    int read = response.body().byteStream().read(buffer);
+                    return read > 0;
+                }
+            }
         } catch (Exception e) {
-            return false;
+            e.printStackTrace();
         }
+        return false;
     }
 
     private void stopScan() {
         isScanning = false;
-        if (executorService != null) {
-            executorService.shutdownNow();
-            executorService = null;
+        if (scannerExecutor != null) {
+            scannerExecutor.shutdownNow();
+            scannerExecutor = null;
+        }
+        if (verifierThread != null) {
+            verifierThread.interrupt();
+            verifierThread = null;
         }
         btnScan.setText("Start Scan");
-        tvStatus.append(" (Stopped)");
-    }
-
-    private void finishScan() {
-        isScanning = false;
-        btnScan.setText("Start Scan");
-        tvStatus.setText(tvStatus.getText() + " (Completed)");
-        if (executorService != null) {
-            executorService.shutdown();
-            executorService = null;
-        }
+        tvStatus.setText("Status: Idle");
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         stopScan();
+        if (isServiceConnected) {
+            App.get().unbindService(this);
+        }
+    }
+
+    @Override
+    public void onServiceConnected(ComponentName name, IBinder service) {
+        isServiceConnected = true;
+    }
+
+    @Override
+    public void onServiceDisconnected(ComponentName name) {
+        isServiceConnected = false;
     }
 }
