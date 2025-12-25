@@ -42,4 +42,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: mobile-armeabi_v7a-debug
-        path: app/build/outputs/apk/mobile/armeabi_v7a/debug/*.apk
+        path: app/build/outputs/apk/**/*.apk
